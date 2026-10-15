@@ -1,0 +1,36 @@
+name: publish
+
+on:
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: tag must match pyproject version
+        run: |
+          v=$(grep -m1 '^version' pyproject.toml | awk -F'"' '{print $2}')
+          [ "$v" = "${GITHUB_REF_NAME}" ] || { echo "tag $GITHUB_REF_NAME != pyproject $v"; exit 1; }
+      - run: uv run --with pytest pytest
+      - run: uv build
+      - run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
