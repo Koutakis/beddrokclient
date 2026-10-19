@@ -2,6 +2,7 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+
 [project]
 name = "BeddrokClient"
 version = "3.0.1"
