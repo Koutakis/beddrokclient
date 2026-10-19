@@ -1,108 +1,77 @@
 # BeddrokClient
 
-Python client for the Beddrok encryption API with automatic token management and robust error handling.
+Python client for the Beddrok API: personnummer in, stable numbers out.
 
 ## Installation
+
 ```bash
 pip install BeddrokClient
 ```
 
+## Usage
+
+```python
+from beddrokclient import BeddrokClient
+
+with BeddrokClient(
+    user="cint-clean",
+    password="...",
+    api_url="http://beddrok-api.rst-vdp-lake-beddrok-prod.svc:8000",
+) as beddrok:
+    pseudonyms = beddrok.pseudonymize(["199204062355", "920406-2355"])
+    pseudonyms["199204062355"].number
+    pseudonyms["199204062355"].removed
+
+    resolved = beddrok.resolve([12345])
+    resolved[12345].pin
+    resolved[12345].status
+```
+
+| Method | Endpoint | Access | Returns |
+| --- | --- | --- | --- |
+| `pseudonymize(pins)` | `POST /pseudonymize` | `encrypt` | `{pin: Pseudonym(pin, number, removed)}` |
+| `resolve(numbers)` | `POST /resolve` | `decrypt` | `{number: Resolved(number, pin, status)}`, status `ok`, `removed` or `unknown` |
+| `health()` | `GET /health/api` | none | `True` if the API answers |
+
+## What it does for you
+
+- Logs in through `POST /auth/token` and renews the token 5 minutes before it expires, reading the expiry from the JWT. On a 401 it logs in again once and retries.
+- Splits input into batches: 1000 pins per `/pseudonymize` call, 20 numbers per `/resolve` call, the API's default limits. Duplicates are sent once.
+- Retries connection errors and 503 with exponential backoff, `backoff_base ** attempt` seconds, up to `max_retries`.
+
+## What it never does
+
+- **It never changes a pin.** Pins are sent exactly as given. Beddrok gives `920406-2355` and `199204062355` two different numbers, so pass values exactly as the source has them.
+- **It never returns a partial answer.** If any pin or number is missing from the response, it raises `BeddrokError`. It never falls back to the original value.
+- **It never puts a personnummer in an error.** `BeddrokError` carries `path`, `status` and the HTTP reason only. Response bodies are never included, because a 422 echoes the request.
+
+## Configuration
+
+```python
+BeddrokClient(
+    user="...",
+    password="...",
+    api_url="...",
+    timeout=30,
+    max_retries=3,
+    backoff_base=2.0,
+    pseudonymize_batch_size=1000,
+    resolve_batch_size=20,
+    refresh_token_before_seconds=300,
+)
+```
+
+## Upgrading from 2.x
+
+3.0 targets the Beddrok API as it is deployed. The 2.x methods called endpoints that API does not have (`/encrypt`, `/decrypt`, `/validate`) and have been removed: `encrypt_pins`, `decrypt_pins`, `validate_pins`, and the pandas and polars DataFrame helpers. Use `pseudonymize` and `resolve` instead. pandas, polars and roskarl are no longer dependencies.
+
 ## Development
-Dependencies are declared in `pyproject.toml`. For a local editable install with the dev tools (pytest, ruff, pyright):
+
 ```bash
 pip install -e ".[dev]"
 ruff check . && ruff format --check .
 pyright
 pytest
 ```
-These are the same checks the PR workflow runs.
 
-## Quick Start
-```python
-from beddrok_client import BeddrokClient
-
-client = BeddrokClient(
-    user="username",
-    password="password",
-    api_url="https://api.beddrok.com"
-)
-
-# Encrypt/decrypt individual PINs
-encrypted = client.encrypt_pins(["123456", "789012"])
-decrypted = client.decrypt_pins(["enc_abc123", "enc_def456"])
-
-# Validate PINs
-validation = client.validate_pins(["123456", "789012"])
-```
-
-## DataFrame Operations
-
-### Pandas
-```python
-import pandas as pd
-
-df = pd.DataFrame({
-    'id': [1, 2, 3],
-    'pin': ['123456', '789012', '345678']
-})
-
-# Encrypt
-encrypted_df = client.encrypt_pandas_dataframe(df, 'pin', batch_size=100)
-
-# Decrypt
-decrypted_df = client.decrypt_pandas_dataframe(encrypted_df, 'pin', batch_size=100)
-```
-
-### Polars
-```python
-import polars as pl
-
-df = pl.DataFrame({
-    'id': [1, 2, 3],
-    'pin': ['123456', '789012', '345678']
-})
-
-# Encrypt
-encrypted_df = client.encrypt_polars_dataframe(df, 'pin', batch_size=100)
-
-# Decrypt
-decrypted_df = client.decrypt_polars_dataframe(encrypted_df, 'pin', batch_size=100)
-```
-
-## Configuration
-```python
-client = BeddrokClient(
-    user="username",
-    password="password",
-    api_url="https://api.beddrok.com",
-    refresh_token_after_x_minutes=5,  # Token refresh buffer (default: 5)
-    timeout=30,                        # Request timeout (default: 30)
-    max_retries=3,                     # Retry attempts (default: 3)
-    backoff_base=2.0,                  # Exponential backoff (default: 2.0)
-    token_endpoint="auth/token",       # Relative to api_url (default shown)
-    encrypt_endpoint="v2/encrypt",
-    decrypt_endpoint="v2/decrypt",
-    validate_endpoint="v2/validate",
-)
-```
-
-### Token Management
-
-- Automatic token refresh before expiration
-- Thread-safe token operations
-- JWT payload parsing for expiration tracking
-
-### Network Resilience
-
-- Exponential backoff retry: `backoff_base ^ (attempt + 1)`
-- Handles 503 database errors
-- Connection/timeout error recovery
-
-## License
-
-GPL-3.0
-
-## Links
-
-- [GitHub](https://github.com/Koutakis/beddrokclient)
-- [PyPI](https://pypi.org/project/BeddrokClient/)
+The tests run against a local fake Beddrok server, no cluster needed.

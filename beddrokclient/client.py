@@ -1,15 +1,38 @@
 import base64
-from dataclasses import dataclass, field
-from datetime import datetime
-import time
 import json
-from typing import Optional, Any
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import pandas as pd
-import polars as pl
+import logging
 import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Self
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+TOKEN_LIFETIME_FALLBACK_SECONDS = 30 * 60
+
+
+class BeddrokError(RuntimeError):
+    def __init__(self, *, path: str, status: int | None, reason: str) -> None:
+        self.path = path
+        self.status = status
+        answered = "no response" if status is None else str(status)
+        super().__init__(f"Beddrok {path}: {answered} {reason}")
+
+
+@dataclass(frozen=True)
+class Pseudonym:
+    pin: str
+    number: int
+    removed: bool
+
+
+@dataclass(frozen=True)
+class Resolved:
+    number: int
+    pin: str | None
+    status: str
 
 
 @dataclass
@@ -17,297 +40,206 @@ class BeddrokClient:
     user: str
     password: str
     api_url: str
-    refresh_token_after_x_minutes: int = 5
-    timeout: int = 30
+    timeout: float = 30
     max_retries: int = 3
     backoff_base: float = 2.0
-    token_endpoint: str = "auth/token"
-    encrypt_endpoint: str = "encrypt"
-    decrypt_endpoint: str = "decrypt"
-    validate_endpoint: str = "validate"
+    pseudonymize_batch_size: int = 1000
+    resolve_batch_size: int = 20
+    refresh_token_before_seconds: int = 300
     _session: requests.Session = field(init=False, repr=False)
-    _token: Optional[str] = field(default=None, init=False, repr=False)
+    _token: str | None = field(default=None, init=False, repr=False)
+    _token_renew_at: float = field(default=0.0, init=False, repr=False)
     _lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
 
     def __post_init__(self) -> None:
-        self._session = self._create_session()
-
-    def _create_session(self) -> requests.Session:
-        session = requests.Session()
-        retry = Retry(
-            total=0,
-            connect=self.max_retries,
-            read=self.max_retries,
-            backoff_factor=self.backoff_base,
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        return session
+        self.api_url = self.api_url.rstrip("/")
+        self._session = requests.Session()
 
     def close(self) -> None:
-        if self._session:
-            self._session.close()
+        self._session.close()
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def get_token_expiration(self) -> Optional[datetime]:
-        if self._token is None:
-            return None
-
+    def health(self) -> bool:
         try:
-            payload_b64 = self._token.split(".")[1]
-            payload_b64 += "=" * (4 - len(payload_b64) % 4)
-            payload = json.loads(base64.b64decode(payload_b64))
+            response = self._session.get(
+                f"{self.api_url}/health/api", timeout=self.timeout
+            )
+        except requests.RequestException:
+            return False
+        return response.ok
 
-            exp_timestamp = payload.get("exp")
-            if exp_timestamp is None:
-                return None
-
-            return datetime.fromtimestamp(exp_timestamp)
-        except Exception:
-            return None
-
-    def should_refresh_token(self) -> bool:
-        exp_time = self.get_token_expiration()
-        if exp_time is None:
-            return True
-
-        time_until_exp = (exp_time - datetime.now()).total_seconds()
-        return time_until_exp <= (self.refresh_token_after_x_minutes * 60)
-
-    def get_token(self) -> str:
-        with self._lock:
-            if self._token is None or self.should_refresh_token():
-                token_response = self._call_api(
-                    endpoint=self.token_endpoint,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    data={"username": self.user, "password": self.password},
-                    form_encoded=True,
+    def pseudonymize(self, pins: list[str]) -> dict[str, Pseudonym]:
+        wanted = list(dict.fromkeys(pins))
+        result: dict[str, Pseudonym] = {}
+        for start in range(0, len(wanted), self.pseudonymize_batch_size):
+            batch = wanted[start : start + self.pseudonymize_batch_size]
+            body = self._authorized_post(path="/pseudonymize", body={"pins": batch})
+            for item in _items(
+                path="/pseudonymize", body=body, keys=("pin", "number", "removed")
+            ):
+                result[item["pin"]] = Pseudonym(
+                    pin=item["pin"],
+                    number=_integer(path="/pseudonymize", value=item["number"]),
+                    removed=bool(item["removed"]),
                 )
-                if "access_token" not in token_response:
-                    raise Exception(str(token_response))
-                token: str = token_response["access_token"]
-                self._token = token
-        return self._token
+            missing = len(set(batch) - result.keys())
+            if missing:
+                raise BeddrokError(
+                    path="/pseudonymize",
+                    status=200,
+                    reason=f"{missing} of {len(batch)} pins got no number",
+                )
+        return result
 
-    def _call_api(
+    def resolve(self, numbers: list[int]) -> dict[int, Resolved]:
+        wanted = list(dict.fromkeys(numbers))
+        result: dict[int, Resolved] = {}
+        for start in range(0, len(wanted), self.resolve_batch_size):
+            batch = wanted[start : start + self.resolve_batch_size]
+            body = self._authorized_post(path="/resolve", body={"numbers": batch})
+            for item in _items(
+                path="/resolve", body=body, keys=("number", "pin", "status")
+            ):
+                number = _integer(path="/resolve", value=item["number"])
+                result[number] = Resolved(
+                    number=number, pin=item["pin"], status=str(item["status"])
+                )
+            missing = len(set(batch) - result.keys())
+            if missing:
+                raise BeddrokError(
+                    path="/resolve",
+                    status=200,
+                    reason=f"{missing} of {len(batch)} numbers got no answer",
+                )
+        return result
+
+    def _send(
         self,
-        endpoint: str,
+        *,
+        path: str,
         headers: dict[str, str],
-        data: Optional[dict[str, Any]] = None,
-        form_encoded: bool = False,
-    ) -> Any:
-        for attempt in range(self.max_retries):
+        json_body: Any = None,
+        form_body: dict[str, str] | None = None,
+    ) -> requests.Response:
+        attempt = 1
+        while True:
             try:
                 response = self._session.post(
-                    f"{self.api_url}/{endpoint}",
-                    json=None if form_encoded else data,
-                    data=data if form_encoded else None,
+                    f"{self.api_url}{path}",
+                    json=json_body,
+                    data=form_body,
                     headers=headers,
                     timeout=self.timeout,
                 )
-
-                if response.status_code == 503:
-                    if attempt == self.max_retries - 1:
-                        raise Exception(
-                            f"Failed after {self.max_retries} attempts: Database connection error"
-                        )
-
-                    wait_time = self.backoff_base ** (attempt + 1)
-                    print(
-                        f"Attempt {attempt + 1} failed: Database error. Retrying in {wait_time}s..."
+            except requests.RequestException as error:
+                if attempt >= self.max_retries:
+                    raise BeddrokError(
+                        path=path, status=None, reason=type(error).__name__
+                    ) from None
+            else:
+                if response.status_code != 503:
+                    return response
+                if attempt >= self.max_retries:
+                    raise BeddrokError(
+                        path=path, status=503, reason="database unavailable"
                     )
-                    time.sleep(wait_time)
-                    continue
-
-                response.raise_for_status()
-
-                try:
-                    return response.json()
-                except Exception:
-                    raise Exception(
-                        f"{self.api_url}/{endpoint}: Non-JSON response: {response.text}"
-                    )
-
-            except requests.exceptions.HTTPError as e:
-                raise Exception(f"HTTP {e.response.status_code}: {e.response.text}")
-            except (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.RequestException,
-            ) as e:
-                if attempt == self.max_retries - 1:
-                    raise Exception(
-                        f"Failed after {self.max_retries} attempts: {str(e)}"
-                    )
-
-                wait_time = self.backoff_base ** (attempt + 1)
-                print(
-                    f"Attempt {attempt + 1} failed: {str(e)}. Retrying in {wait_time}s..."
-                )
-                time.sleep(wait_time)
-
-        raise Exception(f"Exhausted all retries for {endpoint}")
-
-    def encrypt_pins(self, pins: list[str]) -> list[dict[str, Any]]:
-        token = self.get_token()
-        return self._call_api(
-            endpoint=self.encrypt_endpoint,
-            headers={
-                "Authorization": f"bearer {token}",
-                "Content-Type": "application/json",
-            },
-            data={"pins": pins},
-        )
-
-    def decrypt_pins(self, encrypted_strings: list[str]) -> list[dict[str, str | bool]]:
-        token = self.get_token()
-        return self._call_api(
-            endpoint=self.decrypt_endpoint,
-            headers={
-                "Authorization": f"bearer {token}",
-                "Content-Type": "application/json",
-            },
-            data={"encrypted_strings": encrypted_strings},
-        )
-
-    def validate_pins(self, pins: list[str]) -> list[dict]:
-        response = self._session.post(
-            f"{self.api_url}/{self.validate_endpoint}", json={"pins": pins}
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def encrypt_pandas_dataframe(
-        self,
-        df: pd.DataFrame,
-        column_name: str,
-        batch_size: int = 100,
-    ) -> pd.DataFrame:
-        mask = pd.notna(df[column_name])
-        pins_to_encrypt = df.loc[mask, column_name].astype(str).tolist()
-
-        print(f"Encrypting {len(pins_to_encrypt)} rows (pandas)")
-
-        all_results = []
-        for i in range(0, len(pins_to_encrypt), batch_size):
-            batch = pins_to_encrypt[i : i + batch_size]
-            results = self.encrypt_pins(pins=batch)
-            all_results.extend(results)
-
-        pin_to_encrypted = {r["pin"]: r["encrypted_id"] for r in all_results}
-
-        df.loc[mask, column_name] = (
-            df.loc[mask, column_name]
-            .astype(str)
-            .map(pin_to_encrypted)
-            .fillna(df.loc[mask, column_name])
-        )
-
-        return df
-
-    def encrypt_polars_dataframe(
-        self,
-        df: pl.DataFrame,
-        column_name: str,
-        batch_size: int = 100,
-    ) -> pl.DataFrame:
-        mask = df[column_name].is_not_null()
-        pins_to_encrypt = df.filter(mask)[column_name].cast(pl.Utf8).to_list()
-
-        print(f"Encrypting {len(pins_to_encrypt)} rows (polars)")
-
-        all_results = []
-        for i in range(0, len(pins_to_encrypt), batch_size):
-            batch = pins_to_encrypt[i : i + batch_size]
-            results = self.encrypt_pins(pins=batch)
-            all_results.extend(results)
-
-        pin_to_encrypted = {r["pin"]: r["encrypted_id"] for r in all_results}
-
-        df = df.with_columns(
-            pl.when(mask)
-            .then(
-                pl.col(column_name)
-                .cast(pl.Utf8)
-                .replace_strict(
-                    pin_to_encrypted, default=pl.col(column_name), return_dtype=pl.Utf8
-                )
+            wait = self.backoff_base**attempt
+            logger.warning(
+                "Beddrok %s attempt %d of %d failed, retrying in %.0fs",
+                path,
+                attempt,
+                self.max_retries,
+                wait,
             )
-            .otherwise(pl.col(column_name))
-            .alias(column_name)
-        )
+            time.sleep(wait)
+            attempt += 1
 
-        return df
-
-    def decrypt_pandas_dataframe(
-        self,
-        df: pd.DataFrame,
-        column_name: str,
-        batch_size: int = 100,
-    ) -> pd.DataFrame:
-        mask = pd.notna(df[column_name])
-        encrypted_to_decrypt = df.loc[mask, column_name].astype(str).tolist()
-
-        print(f"Decrypting {len(encrypted_to_decrypt)} rows (pandas)")
-
-        all_results = []
-        for i in range(0, len(encrypted_to_decrypt), batch_size):
-            batch = encrypted_to_decrypt[i : i + batch_size]
-            results = self.decrypt_pins(encrypted_strings=batch)
-            all_results.extend(results)
-
-        encrypted_to_pin = {
-            r["encrypted_string"]: r["decrypted_string"]
-            for r in all_results
-            if r["decrypted_string"] is not None
-        }
-
-        df.loc[mask, column_name] = (
-            df.loc[mask, column_name].astype(str).map(encrypted_to_pin)
-        )
-
-        return df
-
-    def decrypt_polars_dataframe(
-        self,
-        df: pl.DataFrame,
-        column_name: str,
-        batch_size: int = 100,
-    ) -> pl.DataFrame:
-        mask = df[column_name].is_not_null()
-        encrypted_to_decrypt = df.filter(mask)[column_name].cast(pl.Utf8).to_list()
-
-        print(f"Decrypting {len(encrypted_to_decrypt)} rows (polars)")
-
-        all_results = []
-        for i in range(0, len(encrypted_to_decrypt), batch_size):
-            batch = encrypted_to_decrypt[i : i + batch_size]
-            results = self.decrypt_pins(encrypted_strings=batch)
-            all_results.extend(results)
-
-        encrypted_to_pin = {
-            r["encrypted_string"]: r["decrypted_string"]
-            for r in all_results
-            if r["decrypted_string"] is not None
-        }
-
-        df = df.with_columns(
-            pl.when(mask)
-            .then(
-                pl.col(column_name)
-                .cast(pl.Utf8)
-                .replace_strict(encrypted_to_pin, default=None)
+    def _json(self, *, path: str, response: requests.Response) -> Any:
+        if not response.ok:
+            raise BeddrokError(
+                path=path, status=response.status_code, reason=response.reason
             )
-            .otherwise(pl.col(column_name))
-            .alias(column_name)
+        try:
+            return response.json()
+        except ValueError:
+            raise BeddrokError(
+                path=path, status=response.status_code, reason="response is not JSON"
+            ) from None
+
+    def _login(self) -> None:
+        path = "/auth/token"
+        response = self._send(
+            path=path,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            form_body={
+                "grant_type": "password",
+                "username": self.user,
+                "password": self.password,
+            },
+        )
+        body = self._json(path=path, response=response)
+        token = body.get("access_token") if isinstance(body, dict) else None
+        if not isinstance(token, str):
+            raise BeddrokError(
+                path=path,
+                status=response.status_code,
+                reason="no access_token in response",
+            )
+        self._token = token
+        self._token_renew_at = (
+            _token_expiry(token=token) - self.refresh_token_before_seconds
         )
 
-        return df
+    def _bearer(self, *, force_login: bool = False) -> str:
+        with self._lock:
+            if (
+                force_login
+                or self._token is None
+                or time.time() >= self._token_renew_at
+            ):
+                self._login()
+            return f"Bearer {self._token}"
+
+    def _authorized_post(self, *, path: str, body: dict[str, Any]) -> Any:
+        headers = {"Content-Type": "application/json", "Authorization": self._bearer()}
+        response = self._send(path=path, headers=headers, json_body=body)
+        if response.status_code == 401:
+            headers["Authorization"] = self._bearer(force_login=True)
+            response = self._send(path=path, headers=headers, json_body=body)
+        return self._json(path=path, response=response)
+
+
+def _token_expiry(*, token: str) -> float:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except (IndexError, KeyError, ValueError, TypeError):
+        return time.time() + TOKEN_LIFETIME_FALLBACK_SECONDS
+
+
+def _items(*, path: str, body: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not isinstance(body, list) or not all(
+        isinstance(item, dict) and set(keys) <= item.keys() for item in body
+    ):
+        raise BeddrokError(
+            path=path,
+            status=200,
+            reason=f"expected a list of objects with {', '.join(keys)}",
+        )
+    return body
+
+
+def _integer(*, path: str, value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise BeddrokError(
+            path=path, status=200, reason=f"number is {type(value).__name__}, not int"
+        )
+    return value

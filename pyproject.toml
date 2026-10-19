@@ -1,44 +1,30 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "BeddrokClient"
-version = "2.0.3"
-authors = [
- { name="Alexander Koutakis" },
-]
+version = "3.0.0"
 description = "Client for interacting with Beddrok"
 readme = "README.md"
+authors = [{ name = "Alexander Koutakis" }]
+license = { file = "LICENSE" }
 requires-python = ">=3.12"
 classifiers = [
- "Programming Language :: Python :: 3",
- "Programming Language :: Python :: 3.12",
- "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
- "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
 ]
-license = {text = "GPL-3.0"}
 dependencies = [
     "requests>=2.32.3,<3.0.0",
-    "pandas>=2.2.3,<3.0.0",
-    "roskarl>=2.3.4,<3.0.0",
-    "polars>=1.36.1",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest",
-    "ruff",
-    "pyright",
-]
+dev = ["pytest", "ruff", "pyright"]
 
 [project.urls]
 Homepage = "https://github.com/Koutakis/beddrokclient"
 Issues = "https://github.com/Koutakis/beddrokclient/issues"
 
-[tool.ruff]
-target-version = "py312"
-
-[tool.pyright]
-pythonVersion = "3.12"
-include = ["beddrokclient", "tests", "conftest.py"]
+[tool.setuptools]
+packages = ["beddrokclient"]
