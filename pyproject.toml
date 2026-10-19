@@ -20,7 +20,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "pyright"]
+arrow = ["pyarrow>=17.0"]
+dev = ["pytest", "ruff", "pyright", "pyarrow>=17.0"]
 
 [project.urls]
 Homepage = "https://github.com/Koutakis/beddrokclient"

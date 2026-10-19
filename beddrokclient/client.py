@@ -4,10 +4,11 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Self
-
+from typing import TYPE_CHECKING, Any, Self
 import requests
 
+if TYPE_CHECKING:
+    import pyarrow as pa
 logger = logging.getLogger(__name__)
 
 TOKEN_LIFETIME_FALLBACK_SECONDS = 30 * 60
@@ -97,6 +98,32 @@ class BeddrokClient:
                     reason=f"{missing} of {len(batch)} pins got no number",
                 )
         return result
+
+    def swap_personnummer_for_numbers(
+        self, *, table: "pa.Table", columns: list[str]
+    ) -> "pa.Table":
+        import pyarrow as pa
+
+        pins = sorted(
+            {
+                pin
+                for column in columns
+                for pin in table.column(column).to_pylist()
+                if pin is not None
+            }
+        )
+        pseudonyms = self.pseudonymize(pins) if pins else {}
+        for column in columns:
+            numbers = [
+                None if pin is None else pseudonyms[pin].number
+                for pin in table.column(column).to_pylist()
+            ]
+            table = table.set_column(
+                table.schema.get_field_index(column),
+                pa.field(column, pa.int64()),
+                pa.array(numbers, pa.int64()),
+            )
+        return table
 
     def resolve(self, numbers: list[int]) -> dict[int, Resolved]:
         wanted = list(dict.fromkeys(numbers))

@@ -273,3 +273,43 @@ def test_health(api: FakeBeddrok) -> None:
 def test_empty_input_makes_no_calls(api: FakeBeddrok) -> None:
     assert client(api).pseudonymize([]) == {}
     assert api.logins == 0
+
+
+def test_swap_personnummer_for_numbers(api: FakeBeddrok) -> None:
+    import pyarrow as pa
+
+    table = pa.table(
+        {
+            "id": [1, 2, 3],
+            "patient": [SECRET, "191212121212", None],
+            "relative": ["191212121212", None, SECRET],
+        }
+    )
+    swapped = client(api).swap_personnummer_for_numbers(
+        table=table, columns=["patient", "relative"]
+    )
+    numbers = api.numbers
+    assert swapped.schema.field("patient").type == pa.int64()
+    assert swapped.column("patient").to_pylist() == [
+        numbers[SECRET],
+        numbers["191212121212"],
+        None,
+    ]
+    assert swapped.column("relative").to_pylist() == [
+        numbers["191212121212"],
+        None,
+        numbers[SECRET],
+    ]
+    assert swapped.column("id").to_pylist() == [1, 2, 3]
+    assert api.batches == [2]
+
+
+def test_swap_with_only_nulls_makes_no_calls(api: FakeBeddrok) -> None:
+    import pyarrow as pa
+
+    table = pa.table({"patient": pa.array([None, None], pa.string())})
+    swapped = client(api).swap_personnummer_for_numbers(
+        table=table, columns=["patient"]
+    )
+    assert swapped.column("patient").to_pylist() == [None, None]
+    assert api.logins == 0
