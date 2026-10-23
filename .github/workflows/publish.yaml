@@ -14,7 +14,7 @@ jobs:
         run: |
           v=$(grep -m1 '^version' pyproject.toml | awk -F'"' '{print $2}')
           [ "$v" = "${GITHUB_REF_NAME}" ] || { echo "tag $GITHUB_REF_NAME != pyproject $v"; exit 1; }
-      - run: uv run --with pytest pytest
+      - run: uv run --extra arrow --with pytest pytest
       - run: uv build
       - run: uvx twine check dist/*
       - uses: actions/upload-artifact@v4
